@@ -1,6 +1,9 @@
+import streamlit as st
 import pandas as pd
 import numpy as np
 import ccxt
+
+st.set_page_config(layout="wide")
 
 exchange = ccxt.binance({
     "enableRateLimit": True,
@@ -8,7 +11,7 @@ exchange = ccxt.binance({
 })
 
 # -----------------------------
-# Fetch historical data
+# Historical data fetch
 # -----------------------------
 def fetch_ohlcv_range(symbol, timeframe, days=365):
     now_ms = exchange.milliseconds()
@@ -17,15 +20,9 @@ def fetch_ohlcv_range(symbol, timeframe, days=365):
     all_rows = []
     while since_ms < now_ms:
         try:
-            new_rows = exchange.fetch_ohlcv(
-                symbol,
-                timeframe=timeframe,
-                since=since_ms,
-                limit=1000
-            )
+            new_rows = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=1000)
             if not new_rows:
                 break
-
             all_rows.extend(new_rows)
             since_ms = new_rows[-1][0] + 1
         except Exception:
@@ -39,6 +36,9 @@ def fetch_ohlcv_range(symbol, timeframe, days=365):
     df = df.sort_values("ts").reset_index(drop=True)
     return df
 
+# -----------------------------
+# Strategy functions
+# -----------------------------
 def trend_direction(series):
     if len(series) < 2:
         return "Neutral"
@@ -107,16 +107,12 @@ def get_signal(df_1h, df_4h, df_1d):
 
     return "NoTrade"
 
-# -----------------------------
-# Backtest
-# -----------------------------
 def backtest(symbol="BTC/USDT", days=365):
     df_1h = fetch_ohlcv_range(symbol, "1h", days)
     df_4h = fetch_ohlcv_range(symbol, "4h", days)
     df_1d = fetch_ohlcv_range(symbol, "1d", days)
 
     if df_1h.empty or df_4h.empty or df_1d.empty:
-        print("No data found.")
         return pd.DataFrame()
 
     position = 0
@@ -203,7 +199,6 @@ def generate_report(trades_df):
     gross_loss = abs(df[df["pnl_pct"] < 0]["pnl_pct"].sum())
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.inf
 
-    # max drawdown calc
     equity = 1000.0
     peak = equity
     max_drawdown = 0.0
@@ -223,15 +218,44 @@ def generate_report(trades_df):
         "avg_trade_pct": round(avg_trade_pct, 2),
         "max_drawdown_pct": round(max_drawdown, 2),
         "best_trade_pct": round(df["pnl_pct"].max(), 2),
-        "worst_trade_pct": round(df["pnl_pct"].min(), 2)
+        "worst_trade_pct": round(df["pnl_pct"].min(), 2),
+        "wins": int(wins),
+        "losses": int(losses)
     }
     return report
 
 # -----------------------------
-# Run
+# UI
 # -----------------------------
-trades_df = backtest("BTC/USDT", days=365)
-report = generate_report(trades_df)
+st.title("Binance Smart Money Backtest Dashboard")
 
-print("Strategy Report")
-print(report)
+symbol = st.selectbox("Symbol", ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"])
+days = st.slider("Backtest Days", 30, 365, 365)
+
+if st.button("Run Backtest"):
+    with st.spinner("Running strategy..."):
+        trades_df = backtest(symbol=symbol, days=days)
+        report = generate_report(trades_df)
+
+    st.success("Backtest completed")
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Win Rate %", f"{report['win_rate']}%")
+    col2.metric("Total PnL %", f"{report['total_pnl_pct']}%")
+    col3.metric("Profit Factor", f"{report['profit_factor']}")
+    col4.metric("Max Drawdown %", f"{report['max_drawdown_pct']}%")
+
+    col5, col6, col7, col8 = st.columns(4)
+    col5.metric("Trades", report["total_trades"])
+    col6.metric("Avg Trade %", f"{report['avg_trade_pct']}%")
+    col7.metric("Best Trade %", f"{report['best_trade_pct']}%")
+    col8.metric("Worst Trade %", f"{report['worst_trade_pct']}%")
+
+    if trades_df.empty:
+        st.warning("No trades found for selected period.")
+    else:
+        st.subheader("Trade Log")
+        st.dataframe(trades_df, use_container_width=True)
+
+    st.subheader("Summary")
+    st.json(report)
