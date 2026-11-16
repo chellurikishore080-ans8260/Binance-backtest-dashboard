@@ -1,261 +1,350 @@
-import streamlit as st
-import pandas as pd
+import io
+import zipfile
+from datetime import date
+from typing import Optional
+
 import numpy as np
-import ccxt
+import pandas as pd
+import requests
+import streamlit as st
 
-st.set_page_config(layout="wide")
 
-exchange = ccxt.binance({
-    "enableRateLimit": True,
-    "timeout": 20000
-})
+st.set_page_config(page_title="Double SuperTrend Binance Backtest", layout="wide")
 
-# -----------------------------
-# Historical data fetch
-# -----------------------------
-def fetch_ohlcv_range(symbol, timeframe, days=365):
-    now_ms = exchange.milliseconds()
-    since_ms = now_ms - (days * 24 * 60 * 60 * 1000)
+VISION_BASE = "https://data.binance.vision/data/spot/monthly/klines"
+BINANCE_API = "https://api.binance.com"
+EXCLUDED_BASES = {
+    "USDC", "FDUSD", "TUSD", "USDP", "BUSD", "DAI", "USDE", "EUR",
+    "USDT", "UST", "USTC", "PAXG",
+}
+INTERVALS = ["5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d"]
+KLINE_COLUMNS = [
+    "open_time", "open", "high", "low", "close", "volume",
+    "close_time", "quote_volume", "trades", "taker_buy_base",
+    "taker_buy_quote", "ignore",
+]
 
-    all_rows = []
-    while since_ms < now_ms:
-        try:
-            new_rows = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=1000)
-            if not new_rows:
-                break
-            all_rows.extend(new_rows)
-            since_ms = new_rows[-1][0] + 1
-        except Exception:
-            break
 
-    if not all_rows:
+@st.cache_data(ttl=900, show_spinner=False)
+def get_top_usdt_symbols(limit: int = 50) -> pd.DataFrame:
+    """Current top active spot USDT pairs ranked by 24h quote volume."""
+    info = requests.get(f"{BINANCE_API}/api/v3/exchangeInfo", timeout=20)
+    info.raise_for_status()
+    tickers = requests.get(f"{BINANCE_API}/api/v3/ticker/24hr", timeout=30)
+    tickers.raise_for_status()
+    eligible = {
+        item["symbol"]
+        for item in info.json()["symbols"]
+        if item.get("status") == "TRADING"
+        and item.get("quoteAsset") == "USDT"
+        and item.get("isSpotTradingAllowed", True)
+        and not item.get("symbol", "").endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"))
+        and item.get("baseAsset") not in EXCLUDED_BASES
+    }
+    rows = [
+        {"symbol": row["symbol"], "quote_volume_24h": float(row["quoteVolume"])}
+        for row in tickers.json()
+        if row.get("symbol") in eligible
+    ]
+    return pd.DataFrame(rows).sort_values("quote_volume_24h", ascending=False).head(limit).reset_index(drop=True)
+
+
+def month_range(start: date, end: date):
+    current = pd.Timestamp(start).replace(day=1)
+    last = pd.Timestamp(end).replace(day=1)
+    while current <= last:
+        yield current.strftime("%Y-%m")
+        current += pd.offsets.MonthBegin(1)
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def fetch_vision_month(symbol: str, interval: str, month: str) -> pd.DataFrame:
+    url = f"{VISION_BASE}/{symbol}/{interval}/{symbol}-{interval}-{month}.zip"
+    response = requests.get(url, timeout=40)
+    if response.status_code == 404:
         return pd.DataFrame()
-
-    df = pd.DataFrame(all_rows, columns=["ts", "open", "high", "low", "close", "volume"])
-    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-    df = df.sort_values("ts").reset_index(drop=True)
-    return df
-
-# -----------------------------
-# Strategy functions
-# -----------------------------
-def trend_direction(series):
-    if len(series) < 2:
-        return "Neutral"
-    if series.iloc[-1] > series.iloc[-2]:
-        return "Bullish"
-    elif series.iloc[-1] < series.iloc[-2]:
-        return "Bearish"
-    return "Neutral"
-
-def liquidity_sweep(df, lookback=20):
-    if len(df) < lookback + 2:
-        return False, "None"
-
-    recent_high = df["high"].tail(lookback).max()
-    recent_low = df["low"].tail(lookback).min()
-    last_high = df["high"].iloc[-1]
-    last_low = df["low"].iloc[-1]
-    last_close = df["close"].iloc[-1]
-
-    bullish = (last_low < recent_low) and (last_close > recent_low)
-    bearish = (last_high > recent_high) and (last_close < recent_high)
-
-    if bullish:
-        return True, "Bullish"
-    if bearish:
-        return True, "Bearish"
-    return False, "None"
-
-def bos_check(df, lookback=10):
-    if len(df) < lookback + 1:
-        return False, "None"
-
-    recent_high = df["high"].tail(lookback).max()
-    recent_low = df["low"].tail(lookback).min()
-    last_close = df["close"].iloc[-1]
-
-    if last_close > recent_high:
-        return True, "Bullish"
-    if last_close < recent_low:
-        return True, "Bearish"
-    return False, "None"
-
-def volume_confirm(df, mult=1.2):
-    if len(df) < 20:
-        return False
-    avg_vol = df["volume"].rolling(20).mean().iloc[-1]
-    last_vol = df["volume"].iloc[-1]
-    return last_vol > avg_vol * mult
-
-def get_signal(df_1h, df_4h, df_1d):
-    if len(df_1h) < 50 or len(df_4h) < 20 or len(df_1d) < 10:
-        return "NoTrade"
-
-    trend_1d = trend_direction(df_1d["close"])
-    trend_4h = trend_direction(df_4h["close"])
-
-    sweep_ok, sweep_dir = liquidity_sweep(df_1h)
-    bos_ok, bos_dir = bos_check(df_1h)
-    vol_ok = volume_confirm(df_1h)
-
-    if trend_1d == "Bullish" and trend_4h == "Bullish" and sweep_ok and sweep_dir == "Bullish" and bos_ok and bos_dir == "Bullish" and vol_ok:
-        return "Long"
-
-    if trend_1d == "Bearish" and trend_4h == "Bearish" and sweep_ok and sweep_dir == "Bearish" and bos_ok and bos_dir == "Bearish" and vol_ok:
-        return "Short"
-
-    return "NoTrade"
-
-def backtest(symbol="BTC/USDT", days=365):
-    df_1h = fetch_ohlcv_range(symbol, "1h", days)
-    df_4h = fetch_ohlcv_range(symbol, "4h", days)
-    df_1d = fetch_ohlcv_range(symbol, "1d", days)
-
-    if df_1h.empty or df_4h.empty or df_1d.empty:
+    response.raise_for_status()
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        csv_name = next((name for name in archive.namelist() if name.endswith(".csv")), None)
+        if csv_name is None:
+            return pd.DataFrame()
+        frame = pd.read_csv(archive.open(csv_name), header=None)
+    if frame.empty:
         return pd.DataFrame()
+    frame = frame.iloc[:, :len(KLINE_COLUMNS)]
+    frame.columns = KLINE_COLUMNS[:len(frame.columns)]
+    needed = ["open_time", "open", "high", "low", "close", "volume"]
+    if not set(needed).issubset(frame.columns):
+        return pd.DataFrame()
+    frame = frame[needed].copy()
+    frame["timestamp"] = pd.to_datetime(pd.to_numeric(frame.pop("open_time"), errors="coerce"), unit="ms", utc=True)
+    for col in ["open", "high", "low", "close", "volume"]:
+        frame[col] = pd.to_numeric(frame[col], errors="coerce")
+    return frame.dropna().sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
 
-    position = 0
-    entry_price = 0
+
+def fetch_vision_range(symbol: str, interval: str, start: date, end: date) -> pd.DataFrame:
+    parts = [fetch_vision_month(symbol, interval, month) for month in month_range(start, end)]
+    parts = [part for part in parts if not part.empty]
+    if not parts:
+        return pd.DataFrame()
+    frame = pd.concat(parts, ignore_index=True).drop_duplicates("timestamp").sort_values("timestamp")
+    start_ts = pd.Timestamp(start, tz="UTC")
+    end_ts = pd.Timestamp(end, tz="UTC") + pd.Timedelta(days=1)
+    # Keep warm-up bars before the selected start; the caller can use the fetched history.
+    return frame[frame["timestamp"] < end_ts].reset_index(drop=True)
+
+
+def pine_supertrend(frame: pd.DataFrame, factor: float, period: int):
+    """Pine-compatible Supertrend direction convention: -1 up, +1 down."""
+    high, low, close = frame["high"], frame["low"], frame["close"]
+    previous_close = close.shift(1)
+    tr = pd.concat(
+        [(high - low), (high - previous_close).abs(), (low - previous_close).abs()], axis=1
+    ).max(axis=1)
+    atr = tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    midpoint = (high + low) / 2
+    basic_upper = midpoint + factor * atr
+    basic_lower = midpoint - factor * atr
+    final_upper = basic_upper.copy()
+    final_lower = basic_lower.copy()
+    line = pd.Series(np.nan, index=frame.index, dtype=float)
+    direction = pd.Series(np.nan, index=frame.index, dtype=float)
+
+    for i in range(len(frame)):
+        if pd.isna(atr.iloc[i]):
+            continue
+        if i == 0 or pd.isna(final_upper.iloc[i - 1]):
+            direction.iloc[i] = 1
+            line.iloc[i] = final_upper.iloc[i]
+            continue
+        prev_upper, prev_lower = final_upper.iloc[i - 1], final_lower.iloc[i - 1]
+        final_upper.iloc[i] = (
+            basic_upper.iloc[i]
+            if basic_upper.iloc[i] < prev_upper or close.iloc[i - 1] > prev_upper
+            else prev_upper
+        )
+        final_lower.iloc[i] = (
+            basic_lower.iloc[i]
+            if basic_lower.iloc[i] > prev_lower or close.iloc[i - 1] < prev_lower
+            else prev_lower
+        )
+        prev_dir = direction.iloc[i - 1]
+        if prev_dir == 1:
+            direction.iloc[i] = -1 if close.iloc[i] > final_upper.iloc[i] else 1
+        else:
+            direction.iloc[i] = 1 if close.iloc[i] < final_lower.iloc[i] else -1
+        line.iloc[i] = final_lower.iloc[i] if direction.iloc[i] == -1 else final_upper.iloc[i]
+    return line, direction
+
+
+def build_signals(frame: pd.DataFrame, fast_atr: int, fast_factor: float,
+                  slow_atr: int, slow_factor: float, entry_rule: str, exit_rule: str) -> pd.DataFrame:
+    data = frame.copy().reset_index(drop=True)
+    data["fast_st"], data["fast_dir"] = pine_supertrend(data, fast_factor, fast_atr)
+    data["slow_st"], data["slow_dir"] = pine_supertrend(data, slow_factor, slow_atr)
+    fast_up, fast_down = data["fast_dir"].eq(-1), data["fast_dir"].eq(1)
+    slow_up, slow_down = data["slow_dir"].eq(-1), data["slow_dir"].eq(1)
+    both_up, both_down = fast_up & slow_up, fast_down & slow_down
+    if entry_rule == "Both agree":
+        long_entry = both_up & ~both_up.shift(1, fill_value=False)
+        short_entry = both_down & ~both_down.shift(1, fill_value=False)
+    else:
+        long_entry = data["fast_st"].gt(data["slow_st"]) & data["fast_st"].shift(1).le(data["slow_st"].shift(1)) & fast_up
+        short_entry = data["fast_st"].lt(data["slow_st"]) & data["fast_st"].shift(1).ge(data["slow_st"].shift(1)) & fast_down
+    data["long_signal"] = long_entry.fillna(False)
+    data["short_signal"] = short_entry.fillna(False)
+    data["exit_long"] = (fast_down if exit_rule == "Fast flips" else slow_down).fillna(False)
+    data["exit_short"] = (fast_up if exit_rule == "Fast flips" else slow_up).fillna(False)
+    return data
+
+
+def backtest_symbol(symbol: str, frame: pd.DataFrame, start: date, notional: float,
+                    fee_rate: float, fast_atr: int, fast_factor: float, slow_atr: int,
+                    slow_factor: float, entry_rule: str, exit_rule: str,
+                    allow_shorts: bool) -> list[dict]:
+    data = build_signals(frame, fast_atr, fast_factor, slow_atr, slow_factor, entry_rule, exit_rule)
+    start_ts = pd.Timestamp(start, tz="UTC")
+    position: Optional[dict] = None
+    pending: Optional[str] = None
     trades = []
 
-    max_len = max(len(df_1h), len(df_4h), len(df_1d))
-    for i in range(max_len):
-        if i < 50:
+    for i in range(1, len(data)):
+        row = data.iloc[i]
+        # Execute confirmed previous-bar signals at this candle's open.
+        if pending is not None:
+            if position is not None:
+                exit_price = float(row["open"])
+                qty = notional / position["entry_price"]
+                gross = (exit_price - position["entry_price"]) * qty * position["side"]
+                fees = fee_rate * (notional + qty * exit_price)
+                net = gross - fees
+                trades.append({
+                    "symbol": symbol,
+                    "side": "Long" if position["side"] == 1 else "Short",
+                    "entry_time": position["entry_time"],
+                    "exit_time": row["timestamp"],
+                    "entry_price": position["entry_price"],
+                    "exit_price": exit_price,
+                    "notional_usd": notional,
+                    "gross_pnl_usd": gross,
+                    "fees_usd": fees,
+                    "net_pnl_usd": net,
+                    "return_pct": net / notional * 100,
+                })
+                position = None
+            if pending in ("long", "short") and (pending == "long" or allow_shorts):
+                side = 1 if pending == "long" else -1
+                position = {"side": side, "entry_price": float(row["open"]), "entry_time": row["timestamp"]}
+            pending = None
+
+        # Signal evaluated at bar close; action is deferred until next bar open.
+        if row["timestamp"] < start_ts:
             continue
+        previous = data.iloc[i - 1]
+        long_sig = bool(previous["long_signal"])
+        short_sig = bool(previous["short_signal"]) and allow_shorts
+        if position is None:
+            if long_sig:
+                pending = "long"
+            elif short_sig:
+                pending = "short"
+        elif position["side"] == 1 and (short_sig or bool(previous["exit_long"])):
+            pending = "short" if short_sig else "exit"
+        elif position["side"] == -1 and (long_sig or bool(previous["exit_short"])):
+            pending = "long" if long_sig else "exit"
 
-        h = df_1h.iloc[:i+1].copy()
-        h4 = df_4h.iloc[:i+1].copy()
-        d1 = df_1d.iloc[:i+1].copy()
-
-        if len(h4) < 20 or len(d1) < 10:
-            continue
-
-        signal = get_signal(h, h4, d1)
-        current_price = h["close"].iloc[-1]
-
-        if signal == "Long" and position == 0:
-            position = 1
-            entry_price = current_price
-
-        elif signal == "Short" and position == 0:
-            position = -1
-            entry_price = current_price
-
-        elif signal == "NoTrade" and position != 0:
-            if position == 1:
-                pnl_pct = (current_price - entry_price) / entry_price * 100
-            else:
-                pnl_pct = (entry_price - current_price) / entry_price * 100
-
-            trades.append({
-                "entry": entry_price,
-                "exit": current_price,
-                "pnl_pct": pnl_pct,
-                "side": "Long" if position == 1 else "Short"
-            })
-            position = 0
-
-    if position != 0:
-        last_price = df_1h["close"].iloc[-1]
-        if position == 1:
-            pnl_pct = (last_price - entry_price) / entry_price * 100
-        else:
-            pnl_pct = (entry_price - last_price) / entry_price * 100
-
+    # Mark any open position to the final available close for a reproducible end-of-test result.
+    if position is not None and not data.empty:
+        last = data.iloc[-1]
+        qty = notional / position["entry_price"]
+        exit_price = float(last["close"])
+        gross = (exit_price - position["entry_price"]) * qty * position["side"]
+        fees = fee_rate * (notional + qty * exit_price)
+        net = gross - fees
         trades.append({
-            "entry": entry_price,
-            "exit": last_price,
-            "pnl_pct": pnl_pct,
-            "side": "Long" if position == 1 else "Short"
+            "symbol": symbol,
+            "side": "Long" if position["side"] == 1 else "Short",
+            "entry_time": position["entry_time"],
+            "exit_time": last["timestamp"],
+            "entry_price": position["entry_price"],
+            "exit_price": exit_price,
+            "notional_usd": notional,
+            "gross_pnl_usd": gross,
+            "fees_usd": fees,
+            "net_pnl_usd": net,
+            "return_pct": net / notional * 100,
+            "note": "Open position marked to final close",
         })
+    return trades
 
-    return pd.DataFrame(trades)
 
-def generate_report(trades_df):
-    if trades_df is None or trades_df.empty:
-        return {
-            "total_trades": 0,
-            "win_rate": 0.0,
-            "total_pnl_pct": 0.0,
-            "profit_factor": 0.0,
-            "avg_trade_pct": 0.0,
-            "max_drawdown_pct": 0.0,
-            "best_trade_pct": 0.0,
-            "worst_trade_pct": 0.0
-        }
-
-    df = trades_df.copy()
-    df["pnl_pct"] = pd.to_numeric(df["pnl_pct"], errors="coerce").fillna(0)
-
-    total_trades = len(df)
-    wins = (df["pnl_pct"] > 0).sum()
-    losses = (df["pnl_pct"] < 0).sum()
-    win_rate = (wins / total_trades) * 100 if total_trades else 0.0
-    total_pnl_pct = df["pnl_pct"].sum()
-    avg_trade_pct = df["pnl_pct"].mean()
-
-    gross_profit = df[df["pnl_pct"] > 0]["pnl_pct"].sum()
-    gross_loss = abs(df[df["pnl_pct"] < 0]["pnl_pct"].sum())
-    profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.inf
-
-    equity = 1000.0
-    peak = equity
-    max_drawdown = 0.0
-    for value in df["pnl_pct"]:
-        equity *= (1 + value / 100)
-        if equity > peak:
-            peak = equity
-        dd = ((peak - equity) / peak) * 100
-        if dd > max_drawdown:
-            max_drawdown = dd
-
-    report = {
-        "total_trades": int(total_trades),
-        "win_rate": round(win_rate, 2),
-        "total_pnl_pct": round(total_pnl_pct, 2),
-        "profit_factor": round(profit_factor, 2),
-        "avg_trade_pct": round(avg_trade_pct, 2),
-        "max_drawdown_pct": round(max_drawdown, 2),
-        "best_trade_pct": round(df["pnl_pct"].max(), 2),
-        "worst_trade_pct": round(df["pnl_pct"].min(), 2),
-        "wins": int(wins),
-        "losses": int(losses)
+def summarize(trades: pd.DataFrame) -> dict:
+    if trades.empty:
+        return {"Trades": 0, "Win rate": 0.0, "Net P&L ($)": 0.0, "Profit factor": 0.0, "Max drawdown ($)": 0.0}
+    ordered = trades.sort_values("exit_time").copy()
+    pnl = ordered["net_pnl_usd"].astype(float)
+    wins, losses = pnl[pnl > 0], pnl[pnl < 0]
+    equity = pnl.cumsum()
+    drawdown = equity.cummax() - equity
+    return {
+        "Trades": int(len(ordered)),
+        "Win rate": float((pnl > 0).mean() * 100),
+        "Net P&L ($)": float(pnl.sum()),
+        "Profit factor": float(wins.sum() / abs(losses.sum())) if losses.sum() < 0 else float("inf"),
+        "Max drawdown ($)": float(drawdown.max()) if not drawdown.empty else 0.0,
+        "Average trade ($)": float(pnl.mean()),
+        "Gross profit ($)": float(wins.sum()),
+        "Gross loss ($)": float(abs(losses.sum())),
     }
-    return report
 
-# -----------------------------
-# UI
-# -----------------------------
-st.title("Binance Smart Money Backtest Dashboard")
 
-symbol = st.selectbox("Symbol", ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"])
-days = st.slider("Backtest Days", 30, 365, 365)
+st.title("Tanmay Kurtkoti Double SuperTrend — Binance Spot Backtest")
+st.caption("Historical candles: Binance Vision spot klines. Spot mode is long-only by default; no live orders or API keys are used.")
 
-if st.button("Run Backtest"):
-    with st.spinner("Running strategy..."):
-        trades_df = backtest(symbol=symbol, days=days)
-        report = generate_report(trades_df)
+with st.sidebar:
+    st.header("Backtest settings")
+    interval = st.selectbox("Candle timeframe", INTERVALS, index=3)
+    start_date = st.date_input("Start date (UTC)", value=date(2024, 1, 1))
+    end_date = st.date_input("End date (UTC)", value=date.today())
+    top_n = st.slider("Top USDT spot coins", min_value=1, max_value=50, value=50)
+    notional = st.number_input("USD per trade", min_value=10.0, value=1000.0, step=100.0)
+    fee_pct = st.number_input("Fee per side (%)", min_value=0.0, value=0.1, step=0.01, format="%.3f")
+    st.subheader("SuperTrend parameters")
+    fast_atr = st.number_input("Fast ATR length", min_value=1, value=10, step=1)
+    fast_factor = st.number_input("Fast factor", min_value=0.1, value=1.5, step=0.1)
+    slow_atr = st.number_input("Slow ATR length", min_value=1, value=10, step=1)
+    slow_factor = st.number_input("Slow factor", min_value=0.1, value=3.0, step=0.1)
+    entry_rule = st.selectbox("Entry rule", ["Both agree", "Fast line crosses slow line"])
+    exit_rule = st.selectbox("Exit rule", ["Fast flips", "Slow flips"])
+    allow_shorts = st.checkbox("Include short trades (not executable on ordinary spot)", value=False)
 
-    st.success("Backtest completed")
+st.info("The coin universe is selected using the **current** 24-hour USDT quote-volume ranking. Applying today's Top 50 to historical dates creates survivorship bias; this is not a historical-universe reconstruction.")
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Win Rate %", f"{report['win_rate']}%")
-    col2.metric("Total PnL %", f"{report['total_pnl_pct']}%")
-    col3.metric("Profit Factor", f"{report['profit_factor']}")
-    col4.metric("Max Drawdown %", f"{report['max_drawdown_pct']}%")
+if start_date >= end_date:
+    st.error("End date must be after start date.")
+    st.stop()
 
-    col5, col6, col7, col8 = st.columns(4)
-    col5.metric("Trades", report["total_trades"])
-    col6.metric("Avg Trade %", f"{report['avg_trade_pct']}%")
-    col7.metric("Best Trade %", f"{report['best_trade_pct']}%")
-    col8.metric("Worst Trade %", f"{report['worst_trade_pct']}%")
+if st.button("Run Top-Coin Backtest", type="primary"):
+    try:
+        with st.spinner("Loading current top USDT spot pairs..."):
+            universe = get_top_usdt_symbols(top_n)
+        st.write("Coins selected by current 24h quote volume:", ", ".join(universe["symbol"].tolist()))
+        all_trades = []
+        failed = []
+        progress = st.progress(0)
+        status = st.empty()
+        for idx, symbol in enumerate(universe["symbol"], start=1):
+            status.text(f"{idx}/{len(universe)} — downloading {symbol} from Binance Vision")
+            try:
+                candles = fetch_vision_range(symbol, interval, start_date, end_date)
+                if candles.empty:
+                    failed.append(f"{symbol}: Binance Vision archive unavailable for selected range")
+                else:
+                    symbol_trades = backtest_symbol(
+                        symbol, candles, start_date, notional, fee_pct / 100,
+                        int(fast_atr), float(fast_factor), int(slow_atr), float(slow_factor),
+                        entry_rule, exit_rule, allow_shorts,
+                    )
+                    all_trades.extend(symbol_trades)
+            except Exception as exc:
+                failed.append(f"{symbol}: {exc}")
+            progress.progress(idx / len(universe))
+        status.empty()
+        progress.empty()
+        trades_df = pd.DataFrame(all_trades)
+        st.session_state["double_st_trades"] = trades_df
+        st.session_state["double_st_failed"] = failed
+        st.session_state["double_st_settings"] = {"interval": interval, "start": str(start_date), "end": str(end_date)}
+    except Exception as exc:
+        st.error(f"Could not load Binance market data: {exc}")
 
+if "double_st_trades" in st.session_state:
+    trades_df = st.session_state["double_st_trades"]
+    failed = st.session_state.get("double_st_failed", [])
+    if failed:
+        with st.expander(f"Data warnings ({len(failed)})"):
+            st.write("\n".join(failed))
     if trades_df.empty:
-        st.warning("No trades found for selected period.")
+        st.warning("No trades found for the selected settings and data range.")
     else:
-        st.subheader("Trade Log")
-        st.dataframe(trades_df, use_container_width=True)
-
-    st.subheader("Summary")
-    st.json(report)
+        report = summarize(trades_df)
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Trades", f"{report['Trades']:,}")
+        c2.metric("Win rate", f"{report['Win rate']:.2f}%")
+        c3.metric("Net P&L", f"${report['Net P&L ($)']:,.2f}")
+        c4.metric("Profit factor", "∞" if np.isinf(report["Profit factor"]) else f"{report['Profit factor']:.2f}")
+        c5.metric("Max drawdown", f"${report['Max drawdown ($)']:,.2f}")
+        st.subheader("Equity (realized P&L, fixed $1,000 notional per entry)")
+        equity = trades_df.sort_values("exit_time").set_index("exit_time")["net_pnl_usd"].cumsum().rename("Cumulative net P&L ($)")
+        st.line_chart(equity)
+        st.subheader("Per-coin performance")
+        per_coin = trades_df.groupby("symbol").agg(
+            trades=("net_pnl_usd", "size"), net_pnl_usd=("net_pnl_usd", "sum"),
+            win_rate_pct=("net_pnl_usd", lambda x: (x > 0).mean() * 100),
+        ).sort_values("net_pnl_usd", ascending=False)
+        st.dataframe(per_coin, use_container_width=True)
+        st.subheader("Trade log")
+        st.dataframe(trades_df.sort_values("entry_time", ascending=False), use_container_width=True)
+        st.download_button("Download trades CSV", trades_df.to_csv(index=False), "double_supertrend_trades.csv", "text/csv")
+        st.caption("Fees are applied on entry and exit at the configured rate. Slippage, taxes, minimum order sizes, and historical coin-universe changes are not modeled. Results are hypothetical, not investment advice.")
